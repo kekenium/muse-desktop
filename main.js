@@ -159,6 +159,18 @@ function dbg(line) {
   }
 }
 
+// Popup diagnostics (v3.6.2): mirror window-open decisions to the shared
+// folder so they can be read over SSH while debugging connector sign-in.
+const POPUP_LOG = 'C:\\Users\\Public\\Muse\\popup-debug.log';
+function plog(line) {
+  dbg(line);
+  try {
+    fs.appendFileSync(POPUP_LOG, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
 // Show a native Windows toast for one account's window (rate-limited per
 // account). Also flashes that window's taskbar button.
 function notifyOnce(title, body, accountId) {
@@ -860,7 +872,16 @@ function createWindow(accountId) {
       /* ignore */
     }
     const isAuthHost = AUTH_HOSTS.some((h) => hostMatches(host, h));
-    if (isInternalUrl(url) || isWindowOpenCall || features.length > 0 || isAuthHost) {
+    // Connector sign-in opens about:blank first (as a plain foreground-tab
+    // open, no features) and navigates it to the provider afterwards.
+    // Denying that placeholder makes Muse report the link could not be
+    // opened, so blank opens always stay in-app.
+    const isBlank = /^about:blank/i.test(url || '');
+    plog(
+      `open(${account.id}): url=${url} disposition=${details.disposition} features=[${features.join(',')}] ` +
+        `internal=${isInternalUrl(url)} windowOpen=${isWindowOpenCall} authHost=${isAuthHost} blank=${isBlank}`
+    );
+    if (isInternalUrl(url) || isWindowOpenCall || features.length > 0 || isAuthHost || isBlank) {
       const popupPrefs = { contextIsolation: true, nodeIntegration: false, sandbox: true };
       if (account.partition) popupPrefs.partition = account.partition;
       return {
@@ -881,7 +902,15 @@ function createWindow(accountId) {
   // sign-in flows) get the same routing.
   const attachOpenHandler = (wc) => {
     wc.setWindowOpenHandler(handleWindowOpen);
-    wc.on('did-create-window', (child) => attachOpenHandler(child.webContents));
+    wc.on('did-create-window', (child) => {
+      plog(`popup created (${account.id}): initial url=${child.webContents.getURL()}`);
+      child.webContents.on('did-navigate', (_e, u) => plog(`popup navigate: ${u}`));
+      child.webContents.on('did-fail-load', (_e, code, desc, u) =>
+        plog(`popup fail-load: ${code} ${desc} ${u}`)
+      );
+      child.on('closed', () => plog(`popup closed (${account.id})`));
+      attachOpenHandler(child.webContents);
+    });
   };
   attachOpenHandler(win.webContents);
 
@@ -1016,7 +1045,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => showWindow());
 
   app.whenReady().then(() => {
-    dbg('app ready (v3.6.1 multi-account)');
+    dbg('app ready (v3.6.3 multi-account)');
     loadAccounts();
     saveAccounts();
     loadAccountState();
