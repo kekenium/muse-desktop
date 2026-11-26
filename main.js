@@ -842,18 +842,17 @@ function createWindow(accountId) {
     lastActiveAccountId = account.id;
   });
 
-  // Links: keep trusted hosts in-app, send everything else to the browser.
-  // Popups inherit the account's session so login flows stay in-account.
-  // Auth-style flows (connector sign-in etc.) open sized popup windows, and
-  // Muse's UI reports an error when such a popup is denied; sending them to
-  // the external browser also breaks the sign-in handshake. So popups and
-  // known sign-in hosts stay in-app, while plain links go to the browser.
-  win.webContents.setWindowOpenHandler((details) => {
+  // Links and popups. Connector sign-in starts with a window.open() call
+  // (disposition "new-window") whose first hop is each provider's own
+  // authorize domain, so host/feature allowlists miss it; denying it makes
+  // Muse report that the link page could not be opened, and sending it to
+  // the external browser breaks the sign-in handshake. Keep every
+  // window.open() in-app with the account's session. Plain target=_blank
+  // link clicks (foreground/background tab) still go to the browser.
+  const handleWindowOpen = (details) => {
     const { url } = details;
     const features = details.features || [];
-    const isPopup = features.some(
-      (f) => f.startsWith('popup') || f.startsWith('width=') || f.startsWith('height=')
-    );
+    const isWindowOpenCall = details.disposition === 'new-window';
     let host = '';
     try {
       host = new URL(url).hostname;
@@ -861,7 +860,7 @@ function createWindow(accountId) {
       /* ignore */
     }
     const isAuthHost = AUTH_HOSTS.some((h) => hostMatches(host, h));
-    if (isInternalUrl(url) || isPopup || isAuthHost) {
+    if (isInternalUrl(url) || isWindowOpenCall || features.length > 0 || isAuthHost) {
       const popupPrefs = { contextIsolation: true, nodeIntegration: false, sandbox: true };
       if (account.partition) popupPrefs.partition = account.partition;
       return {
@@ -877,7 +876,14 @@ function createWindow(accountId) {
     }
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
-  });
+  };
+  // Attach recursively so popups opened from inside a popup (multi-step
+  // sign-in flows) get the same routing.
+  const attachOpenHandler = (wc) => {
+    wc.setWindowOpenHandler(handleWindowOpen);
+    wc.on('did-create-window', (child) => attachOpenHandler(child.webContents));
+  };
+  attachOpenHandler(win.webContents);
 
   win.webContents.on('will-navigate', (event, url) => {
     if (!isInternalUrl(url)) {
@@ -1010,7 +1016,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => showWindow());
 
   app.whenReady().then(() => {
-    dbg('app ready (v3.6 multi-account)');
+    dbg('app ready (v3.6.1 multi-account)');
     loadAccounts();
     saveAccounts();
     loadAccountState();
