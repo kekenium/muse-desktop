@@ -1,8 +1,9 @@
 // Unofficial desktop wrapper for Muse (https://muse.ai/)
 // Features: persistent login, window-state memory, tray icon, global hotkey,
 // optional start-with-Windows, single instance, external links in default browser,
-// dual windows: main and sub accounts can be open at the same time, each in
-// its own window with its own persistent session (v3.5).
+// multiple accounts (up to 10), each with its own window and persistent
+// session, all open at the same time (v3.6). Also: shortcut list popup and
+// auto-update via GitHub Releases when running the packaged installer build.
 
 const {
   app,
@@ -14,6 +15,7 @@ const {
   shell,
   nativeImage,
   session,
+  dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -31,12 +33,22 @@ const INTERNAL_HOSTS = [
   'whatsapp.com',
   'fbcdn.net',
 ];
+// Sign-in hosts for connector OAuth flows. These open in-app even when the
+// site does not mark the window as a popup.
+const AUTH_HOSTS = [
+  'accounts.google.com',
+  'login.microsoftonline.com',
+  'appleid.apple.com',
+  'github.com',
+];
 
 // Accounts. Each account keeps its own persistent session (cookies / login)
-// and its own window; both windows can be open at the same time. 'main' uses
-// the default session so the login that already exists is preserved; 'sub'
-// gets its own partition.
-const ACCOUNTS = [
+// and its own window; all windows can be open at the same time. The list is
+// stored in accounts.json in userData and can hold up to MAX_ACCOUNTS entries.
+// 'main' uses the default session so the login that already exists is
+// preserved; every other account gets its own partition.
+const MAX_ACCOUNTS = 10;
+let accounts = [
   { id: 'main', label: 'メイン', partition: null },
   { id: 'sub', label: 'サブ', partition: 'persist:muse-sub' },
 ];
@@ -49,29 +61,67 @@ app.setAppUserModelId('local.kekenium.muse-desktop');
 const ICON_PATH = path.join(__dirname, 'build', 'icon.png');
 const STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
 const ACCOUNT_FILE = path.join(app.getPath('userData'), 'account-state.json');
+const ACCOUNTS_FILE = path.join(app.getPath('userData'), 'accounts.json');
 
-const windows = { main: null, sub: null };
+const windows = {};
 let lastActiveAccountId = 'main';
 let openAccounts = ['main'];
 let windowStates = {};
 let buildTrayMenu = () => Menu.buildFromTemplate([]);
 
 function accountFor(id) {
-  return ACCOUNTS.find((a) => a.id === id) || ACCOUNTS[0];
+  return accounts.find((a) => a.id === id) || accounts[0];
+}
+
+function accountIndex(id) {
+  return accounts.findIndex((a) => a.id === id);
+}
+
+// Hotkey digit for the account at position i (1-based): 1..9, then 0 for 10th.
+function acceleratorForIndex(i) {
+  return `Control+Shift+${(i + 1) % 10}`;
+}
+
+function loadAccounts() {
+  try {
+    const list = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    if (Array.isArray(list)) {
+      const valid = list
+        .filter((a) => a && typeof a.id === 'string' && typeof a.label === 'string')
+        .map((a) => ({
+          id: a.id,
+          label: a.label,
+          partition: a.id === 'main' ? null : a.partition || `persist:muse-${a.id}`,
+        }));
+      if (valid.length && valid.some((a) => a.id === 'main')) {
+        accounts = valid.slice(0, MAX_ACCOUNTS);
+      }
+    }
+  } catch {
+    /* no accounts.json yet: keep the built-in main + sub defaults */
+  }
+}
+
+function saveAccounts() {
+  try {
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts));
+  } catch {
+    /* ignore */
+  }
 }
 
 function loadAccountState() {
   try {
     const s = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
     if (Array.isArray(s.open)) {
-      const valid = s.open.filter((id) => ACCOUNTS.some((a) => a.id === id));
+      const valid = s.open.filter((id) => accounts.some((a) => a.id === id));
       if (valid.length) openAccounts = valid;
-    } else if (ACCOUNTS.some((a) => a.id === s.current)) {
+    } else if (accounts.some((a) => a.id === s.current)) {
       // v3.4 format: { current: '<id>' }
       openAccounts = [s.current];
     }
-    if (ACCOUNTS.some((a) => a.id === s.lastActive)) lastActiveAccountId = s.lastActive;
-    else if (ACCOUNTS.some((a) => a.id === s.current)) lastActiveAccountId = s.current;
+    if (accounts.some((a) => a.id === s.lastActive)) lastActiveAccountId = s.lastActive;
+    else if (accounts.some((a) => a.id === s.current)) lastActiveAccountId = s.current;
   } catch {
     /* no saved state yet: defaults (main only) */
   }
@@ -79,10 +129,12 @@ function loadAccountState() {
 }
 
 function saveAccountState() {
-  const open = ACCOUNTS.map((a) => a.id).filter((id) => {
-    const w = windows[id];
-    return w && !w.isDestroyed();
-  });
+  const open = accounts
+    .map((a) => a.id)
+    .filter((id) => {
+      const w = windows[id];
+      return w && !w.isDestroyed();
+    });
   try {
     fs.writeFileSync(
       ACCOUNT_FILE,
@@ -287,14 +339,24 @@ function isInternalUrl(url) {
 function loadWindowStates() {
   try {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    if (s && (s.main || s.sub)) {
-      windowStates = s;
-    } else if (s && typeof s.width === 'number') {
-      // v3.4 format: flat bounds for the single window -> main's bounds.
-      windowStates = { main: s };
+    if (s && typeof s === 'object') {
+      if (typeof s.width === 'number') {
+        // v3.4 format: flat bounds for the single window -> main's bounds.
+        windowStates = { main: s };
+      } else {
+        windowStates = s;
+      }
     }
   } catch {
     windowStates = {};
+  }
+}
+
+function saveAllWindowStates() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(windowStates));
+  } catch {
+    /* ignore */
   }
 }
 
@@ -316,8 +378,9 @@ function defaultBoundsFor(accountId) {
   if (accountId === 'main') return { width: 1200, height: 820 };
   const b = { width: base.width || 1200, height: base.height || 820 };
   if (typeof base.x === 'number' && typeof base.y === 'number') {
-    b.x = base.x + 40;
-    b.y = base.y + 40;
+    const offset = 40 * Math.max(1, accountIndex(accountId));
+    b.x = base.x + offset;
+    b.y = base.y + offset;
   }
   return b;
 }
@@ -353,15 +416,306 @@ function focusedOrActiveWindow() {
   return w && !w.isDestroyed() ? w : null;
 }
 
+function rebuildMenus() {
+  createAppMenu();
+  if (tray) tray.setContextMenu(buildTrayMenu());
+}
+
+// ---- Shortcut list popup ---------------------------------------------------
+let shortcutWin = null;
+
+function shortcutRowsHtml() {
+  const rows = [
+    ['Ctrl+Alt+M', 'ウィンドウの表示／非表示'],
+    ...accounts.map((a, i) => [`Ctrl+Shift+${(i + 1) % 10}`, `${a.label}を開く`]),
+    ['Alt+/', 'この一覧を開く／閉じる'],
+    ['F5', '再読み込み'],
+    ['F11', '全画面の切り替え'],
+  ];
+  return rows
+    .map(
+      ([k, v]) =>
+        `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`
+    )
+    .join('');
+}
+
+function toggleShortcutPopup() {
+  if (shortcutWin && !shortcutWin.isDestroyed()) {
+    shortcutWin.close();
+    return;
+  }
+  const html = `<!doctype html><meta charset="utf-8"><title>ショートカット一覧</title>
+    <style>
+      body{margin:0;background:#1d1d21;color:#eee;font-family:"Segoe UI","Yu Gothic UI",sans-serif;padding:14px 16px}
+      h1{font-size:14px;margin:0 0 10px;font-weight:600}
+      .row{display:flex;justify-content:space-between;gap:16px;padding:5px 0;border-bottom:1px solid #333}
+      .row:last-child{border-bottom:0}
+      .k{font-family:Consolas,monospace;font-size:12.5px;color:#ffd479;white-space:nowrap}
+      .v{font-size:12.5px;opacity:.85;text-align:right}
+      .hint{margin-top:10px;font-size:11px;opacity:.55}
+    </style>
+    <h1>ショートカット一覧</h1>
+    ${shortcutRowsHtml()}
+    <div class="hint">Escキー、または外側をクリックすると閉じます</div>`;
+  shortcutWin = new BrowserWindow({
+    width: 400,
+    height: 190 + accounts.length * 30,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    alwaysOnTop: true,
+    title: 'ショートカット一覧',
+    icon: ICON_PATH,
+    autoHideMenuBar: true,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  shortcutWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  shortcutWin.on('blur', () => {
+    if (shortcutWin && !shortcutWin.isDestroyed()) shortcutWin.close();
+  });
+  shortcutWin.webContents.on('before-input-event', (_e, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape' && shortcutWin && !shortcutWin.isDestroyed()) {
+      shortcutWin.close();
+    }
+  });
+  shortcutWin.on('closed', () => {
+    shortcutWin = null;
+  });
+}
+
+// ---- Small text prompt (console-message bridge, no preload needed) --------
+function promptForLabel(defaultLabel) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    const html = `<!doctype html><meta charset="utf-8"><title>アカウントを追加</title>
+    <style>
+      body{margin:0;background:#1d1d21;color:#eee;font-family:"Segoe UI","Yu Gothic UI",sans-serif;padding:16px}
+      label{font-size:13px;display:block;margin-bottom:8px}
+      input{width:100%;box-sizing:border-box;padding:8px 10px;font-size:14px;border-radius:6px;border:1px solid #444;background:#26262b;color:#eee}
+      .btns{margin-top:14px;display:flex;gap:8px;justify-content:flex-end}
+      button{padding:7px 16px;font-size:13px;border-radius:6px;border:0;cursor:pointer}
+      .ok{background:#e8e8e8;color:#111}
+      .cancel{background:#3a3a40;color:#eee}
+    </style>
+    <label>新しいアカウントの表示名</label>
+    <input id="t" type="text" maxlength="20" value="${defaultLabel.replace(/"/g, '&quot;')}">
+    <div class="btns">
+      <button class="cancel" onclick="send(null)">キャンセル</button>
+      <button class="ok" onclick="send(document.getElementById('t').value)">追加</button>
+    </div>
+    <script>
+      const send = (v) => console.log('__MUSE_PROMPT__ ' + JSON.stringify({ value: v }));
+      const input = document.getElementById('t');
+      input.focus(); input.select();
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') send(input.value);
+        if (e.key === 'Escape') send(null);
+      });
+    </script>`;
+    const win = new BrowserWindow({
+      width: 380,
+      height: 190,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      alwaysOnTop: true,
+      title: 'アカウントを追加',
+      icon: ICON_PATH,
+      autoHideMenuBar: true,
+      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+    });
+    win.webContents.on('console-message', (...args) => {
+      let message = '';
+      for (const a of args) {
+        if (typeof a === 'string' && a.startsWith('__MUSE_PROMPT__')) message = a;
+        else if (a && typeof a === 'object' && typeof a.message === 'string' && a.message.startsWith('__MUSE_PROMPT__')) message = a.message;
+      }
+      if (!message) return;
+      try {
+        const d = JSON.parse(message.slice(message.indexOf('{')));
+        done(typeof d.value === 'string' ? d.value : null);
+      } catch {
+        done(null);
+      }
+      if (!win.isDestroyed()) win.close();
+    });
+    win.on('closed', () => done(null));
+    win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  });
+}
+
+// ---- Account add / remove ---------------------------------------------------
+async function addAccount() {
+  if (accounts.length >= MAX_ACCOUNTS) {
+    await dialog.showMessageBox({
+      type: 'info',
+      title: 'アカウントを追加',
+      message: `アカウントは最大${MAX_ACCOUNTS}個までです。`,
+    });
+    return;
+  }
+  const label = await promptForLabel(`アカウント${accounts.length + 1}`);
+  if (label === null) return;
+  const id = 'u' + Date.now().toString(36);
+  const acc = {
+    id,
+    label: label.trim().slice(0, 20) || `アカウント${accounts.length + 1}`,
+    partition: `persist:muse-${id}`,
+  };
+  accounts.push(acc);
+  saveAccounts();
+  setupSession(session.fromPartition(acc.partition));
+  rebuildMenus();
+  showWindow(id);
+  dbg(`account added: ${id} (${acc.label})`);
+}
+
+async function removeAccount(id) {
+  if (id === 'main') return;
+  const acc = accountFor(id);
+  const first = await dialog.showMessageBox({
+    type: 'warning',
+    buttons: ['キャンセル', '削除する'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'アカウントを削除',
+    message: `「${acc.label}」をアカウント一覧から削除しますか？`,
+    detail: '開いているウィンドウは閉じられます。',
+  });
+  if (first.response !== 1) return;
+  const second = await dialog.showMessageBox({
+    type: 'question',
+    buttons: ['ログイン情報を残す', 'ログイン情報も消す'],
+    defaultId: 0,
+    cancelId: 0,
+    title: 'ログイン情報の扱い',
+    message: 'このアカウントのログイン情報（Cookieなど）を消しますか？',
+    detail: '「残す」を選ぶと、同じ名前で再追加したときにログインが残っている場合があります。',
+  });
+  const win = windows[id];
+  if (win && !win.isDestroyed()) win.destroy();
+  if (second.response === 1 && acc.partition) {
+    try {
+      const ses = session.fromPartition(acc.partition);
+      await ses.clearStorageData();
+      await ses.clearCache();
+    } catch (e) {
+      dbg(`clear session error (${id}): ` + (e && e.message));
+    }
+  }
+  accounts = accounts.filter((a) => a.id !== id);
+  saveAccounts();
+  delete windowStates[id];
+  saveAllWindowStates();
+  openAccounts = openAccounts.filter((x) => x !== id);
+  if (lastActiveAccountId === id) lastActiveAccountId = 'main';
+  saveAccountState();
+  rebuildMenus();
+  dbg(`account removed: ${id}`);
+}
+
+// ---- Auto-update (GitHub Releases, packaged builds only) -------------------
+let autoUpdater = null;
+try {
+  autoUpdater = require('electron-updater').autoUpdater;
+} catch {
+  autoUpdater = null;
+}
+let manualUpdateCheck = false;
+
+function setupAutoUpdate() {
+  if (!autoUpdater || !app.isPackaged) {
+    dbg('autoupdate: skipped (dev/asar build or electron-updater missing)');
+    return;
+  }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('error', (e) => dbg('autoupdate error: ' + (e && e.message)));
+  autoUpdater.on('update-available', (info) => dbg('autoupdate available: ' + info.version));
+  autoUpdater.on('update-not-available', () => {
+    dbg('autoupdate: up to date');
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      dialog.showMessageBox({
+        type: 'info',
+        title: '更新の確認',
+        message: 'お使いのバージョンは最新です。',
+      });
+    }
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    dbg('autoupdate downloaded: ' + info.version);
+    try {
+      const n = new Notification({
+        title: 'Muse Desktop の更新',
+        body: `バージョン ${info.version} をダウンロードしました。クリックで再起動して更新します。押さなければ次回終了時に自動で更新されます。`,
+        icon: ICON_PATH,
+      });
+      n.on('click', () => {
+        isQuitting = true;
+        autoUpdater.quitAndInstall();
+      });
+      n.show();
+    } catch {
+      /* ignore */
+    }
+  });
+  const check = () =>
+    autoUpdater.checkForUpdates().catch((e) => dbg('autoupdate check failed: ' + (e && e.message)));
+  setTimeout(check, 10000);
+  setInterval(check, 6 * 60 * 60 * 1000);
+}
+
+function checkForUpdatesManually() {
+  if (!autoUpdater || !app.isPackaged) {
+    dialog.showMessageBox({
+      type: 'info',
+      title: '更新の確認',
+      message: '自動更新はインストーラー版でのみ使えます。',
+    });
+    return;
+  }
+  manualUpdateCheck = true;
+  autoUpdater.checkForUpdates().catch((e) => {
+    manualUpdateCheck = false;
+    dbg('autoupdate manual check failed: ' + (e && e.message));
+  });
+}
+
 function createAppMenu() {
   const template = [
     {
       label: 'アカウント',
-      submenu: ACCOUNTS.map((a, i) => ({
-        label: `${a.label}を開く`,
-        accelerator: `Control+Shift+${i + 1}`,
-        click: () => showWindow(a.id),
-      })),
+      submenu: [
+        ...accounts.map((a, i) => ({
+          label: `${a.label}を開く`,
+          accelerator: acceleratorForIndex(i),
+          click: () => showWindow(a.id),
+        })),
+        { type: 'separator' },
+        {
+          label: 'アカウントを追加…',
+          click: () => addAccount(),
+        },
+        {
+          label: 'アカウントを削除',
+          submenu: accounts
+            .filter((a) => a.id !== 'main')
+            .map((a) => ({
+              label: `${a.label}を削除…`,
+              click: () => removeAccount(a.id),
+            })),
+        },
+      ],
     },
     {
       label: '表示',
@@ -375,6 +729,16 @@ function createAppMenu() {
           },
         },
         { role: 'togglefullscreen' },
+        { type: 'separator' },
+        {
+          label: 'ショートカット一覧',
+          accelerator: 'Alt+/',
+          click: () => toggleShortcutPopup(),
+        },
+        {
+          label: '更新を確認',
+          click: () => checkForUpdatesManually(),
+        },
       ],
     },
   ];
@@ -480,8 +844,24 @@ function createWindow(accountId) {
 
   // Links: keep trusted hosts in-app, send everything else to the browser.
   // Popups inherit the account's session so login flows stay in-account.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isInternalUrl(url)) {
+  // Auth-style flows (connector sign-in etc.) open sized popup windows, and
+  // Muse's UI reports an error when such a popup is denied; sending them to
+  // the external browser also breaks the sign-in handshake. So popups and
+  // known sign-in hosts stay in-app, while plain links go to the browser.
+  win.webContents.setWindowOpenHandler((details) => {
+    const { url } = details;
+    const features = details.features || [];
+    const isPopup = features.some(
+      (f) => f.startsWith('popup') || f.startsWith('width=') || f.startsWith('height=')
+    );
+    let host = '';
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      /* ignore */
+    }
+    const isAuthHost = AUTH_HOSTS.some((h) => hostMatches(host, h));
+    if (isInternalUrl(url) || isPopup || isAuthHost) {
       const popupPrefs = { contextIsolation: true, nodeIntegration: false, sandbox: true };
       if (account.partition) popupPrefs.partition = account.partition;
       return {
@@ -542,16 +922,24 @@ function createTray() {
       { label: 'Museを開く', click: () => showWindow() },
       { type: 'separator' },
       { label: 'アカウント', enabled: false },
-      ...ACCOUNTS.map((a) => ({
+      ...accounts.map((a) => ({
         label: `${a.label}を開く`,
         click: () => showWindow(a.id),
       })),
+      {
+        label: 'アカウントを追加…',
+        click: () => addAccount(),
+      },
       {
         label: '再読み込み',
         click: () => {
           const w = focusedOrActiveWindow();
           if (w) w.webContents.reload();
         },
+      },
+      {
+        label: 'ショートカット一覧',
+        click: () => toggleShortcutPopup(),
       },
       {
         label: '通知テスト',
@@ -578,6 +966,7 @@ function createTray() {
         click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }),
       },
       { type: 'separator' },
+      { label: `バージョン ${app.getVersion()}`, enabled: false },
       {
         label: '終了',
         click: () => {
@@ -621,11 +1010,13 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => showWindow());
 
   app.whenReady().then(() => {
-    dbg('app ready (v3.5 dual window)');
+    dbg('app ready (v3.6 multi-account)');
+    loadAccounts();
+    saveAccounts();
     loadAccountState();
     loadWindowStates();
     setupSession(session.defaultSession);
-    for (const a of ACCOUNTS) {
+    for (const a of accounts) {
       if (a.partition) setupSession(session.fromPartition(a.partition));
     }
     // Restore the windows that were open last time (main only by default).
@@ -633,6 +1024,7 @@ if (!app.requestSingleInstanceLock()) {
     if (windows[lastActiveAccountId]) showWindow(lastActiveAccountId);
     createTray();
     createAppMenu();
+    setupAutoUpdate();
 
     if (!globalShortcut.register(HOTKEY, toggleWindow)) {
       console.warn(`Could not register hotkey ${HOTKEY} (already in use?)`);
@@ -641,7 +1033,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('before-quit', () => {
     isQuitting = true;
-    for (const a of ACCOUNTS) saveWindowState(a.id);
+    for (const a of accounts) saveWindowState(a.id);
     saveAccountState();
   });
   app.on('will-quit', () => globalShortcut.unregisterAll());

@@ -1,1 +1,46 @@
-{"author":"kekenium","build":{"appId":"com.kekenium.muse-desktop","files":["main.js","build/icon.png","package.json"],"nsis":{"allowToChangeInstallationDirectory":true,"oneClick":false},"productName":"Muse Desktop","publish":{"owner":"kekenium","provider":"github","repo":"muse-desktop"},"win":{"icon":"build/icon.png","target":["nsis"]}},"dependencies":{"electron-updater":"^6.3.9"},"description":"Unofficial Windows desktop wrapper for Muse (muse.ai)","devDependencies":{"electron":"^39.0.0","electron-builder":"^26.0.12"},"license":"MIT","main":"main.js","name":"muse-desktop","scripts":{"dist":"electron-builder","pack":"electron-builder --dir","start":"electron ."},"version":"3.5.0"}
+{
+  "author": "kekenium",
+  "build": {
+    "appId": "local.kekenium.muse-desktop",
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "main.js",
+      "build/icon.png",
+      "package.json"
+    ],
+    "nsis": {
+      "allowToChangeInstallationDirectory": true,
+      "oneClick": false,
+      "artifactName": "Muse-Desktop-Setup-${version}.${ext}"
+    },
+    "productName": "Muse Desktop",
+    "publish": {
+      "owner": "kekenium",
+      "provider": "github",
+      "repo": "muse-desktop"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        "nsis"
+      ]
+    }
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "description": "Unofficial Windows desktop wrapper for Muse (muse.ai)",
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "license": "MIT",
+  "main": "main.js",
+  "name": "muse-desktop",
+  "scripts": {
+    "dist": "electron-builder",
+    "pack": "electron-builder --dir",
+    "start": "electron ."
+  },
+  "version": "3.6.0"
+}
